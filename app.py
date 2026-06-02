@@ -1,7 +1,7 @@
 import streamlit as st
 import sqlite3
 import pandas as pd
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 
 
 # ================= 数据库初始化 =================
@@ -25,6 +25,13 @@ init_db()
 
 
 # ================= 核心工具函数 =================
+# 获取强制转换为北京时间 (UTC+8) 的当前时间
+def get_beijing_time():
+    bj_tz = timezone(timedelta(hours=8))
+    # 获取北京时间后，去掉时区标签，方便与前面的时间字符串做比对
+    return datetime.now(bj_tz).replace(tzinfo=None)
+
+
 def get_time_slots():
     slots = []
     start = datetime.strptime("08:00", "%H:%M")
@@ -52,7 +59,6 @@ def check_conflict(book_date, start_time, end_time):
     return False
 
 
-# 获取系统设置
 def get_settings():
     conn = sqlite3.connect('booking.db')
     c = conn.cursor()
@@ -80,7 +86,7 @@ if role == "管理员":
         st.success("管理员登录成功！")
         st.header("⚙️ 预约规则与放号设置")
 
-        st.markdown("##### 1. 设置要开放的【机时日期范围】 (例如下周一到下周日)")
+        st.markdown("##### 1. 设置要开放的【机时日期范围】")
         col_d1, col_d2 = st.columns(2)
         with col_d1:
             target_start = st.date_input("允许预约的开始日期")
@@ -92,7 +98,6 @@ if role == "管理员":
         with col_t1:
             release_date = st.date_input("放号日期")
         with col_t2:
-            # step=60 表示以1分钟为单位选择，满足你的第1点需求
             release_time = st.time_input("放号时间 (精确到分钟)", step=60)
 
         release_datetime = f"{release_date} {release_time.strftime('%H:%M:%S')}"
@@ -105,7 +110,7 @@ if role == "管理员":
             c.execute("REPLACE INTO settings (key, value) VALUES ('target_end', ?)", (str(target_end),))
             conn.commit()
             conn.close()
-            st.success(f"设置成功！系统将在 {release_datetime} 准时开放 {target_start} 至 {target_end} 的机时预约。")
+            st.success(f"设置成功！系统将在北京时间 {release_datetime} 准时开放预约。")
 
         st.markdown("---")
         if st.button("🗑️ 清空所有历史预约记录 (危险)"):
@@ -120,6 +125,10 @@ if role == "管理员":
 
 # ================= 普通用户界面 =================
 elif role == "普通用户":
+    # --- 显示当前服务器的北京时间，方便用户核对 ---
+    current_bj_time = get_beijing_time()
+    st.caption(f"🕒 当前系统时间 (北京时间): {current_bj_time.strftime('%Y-%m-%d %H:%M:%S')}")
+
     if not settings.get('target_start') or not settings.get('release_time'):
         st.info("管理员尚未配置预约规则，请稍后再来。")
         st.stop()
@@ -128,10 +137,8 @@ elif role == "普通用户":
     target_start_dt = datetime.strptime(settings['target_start'], "%Y-%m-%d").date()
     target_end_dt = datetime.strptime(settings['target_end'], "%Y-%m-%d").date()
 
-    # --- 1. 无论是否到时间，都展示本周期“课程表”视图 (需求2 和 需求4) ---
     st.subheader(f"📅 机时预约视图 ({target_start_dt} 至 {target_end_dt})")
 
-    # 构建日期列
     date_list = []
     current_d = target_start_dt
     while current_d <= target_end_dt:
@@ -139,12 +146,10 @@ elif role == "普通用户":
         current_d += timedelta(days=1)
 
     col_names = [f"{d.strftime('%m-%d')} ({get_weekday_cn(d)})" for d in date_list]
-    all_slots = get_time_slots()[:-1]  # 不包含最后一个作为起点的结束时刻 (即22:00)
+    all_slots = get_time_slots()[:-1]
 
-    # 初始化空的 DataFrame
     df_grid = pd.DataFrame("🟢 空闲", index=all_slots, columns=col_names)
 
-    # 填充已预约数据
     conn = sqlite3.connect('booking.db')
     df_bookings = pd.read_sql_query(
         "SELECT user_name, book_date, start_time, end_time FROM bookings WHERE book_date >= ? AND book_date <= ?", conn,
@@ -160,36 +165,28 @@ elif role == "普通用户":
             e_time = row['end_time']
             name = row['user_name']
 
-            # 将对应时间段标红
             for slot in all_slots:
                 if s_time <= slot < e_time:
                     df_grid.at[slot, col_name] = f"🔴 {name}"
 
-    # 展示类似Excel的视图
     st.dataframe(df_grid, use_container_width=True, height=500)
 
     st.markdown("---")
-
-    # --- 2. 用户信息提前填写区域 (需求4) ---
     st.subheader("📝 预约操作区")
     st.info(f"💡 提示：您可以提前填好姓名。预约将于 **{settings['release_time']}** 准时开放。")
 
     col1, col2 = st.columns([1, 2])
     with col1:
-        # 使用 key 保存状态，提前填写不受页面刷新影响
         user_name = st.text_input("1. 输入您的姓名 (必填)", placeholder="例如：张三", key="username_input")
-        # 刷新按钮，用于到点后手动刷新出预约框
         if st.button("🔄 刷新最新状态/抢号"):
             st.rerun()
 
     with col2:
-        now = datetime.now()
-        if now < release_dt:
-            # 未到时间
+        # 【关键修改】：这里不再使用普通的 datetime.now()，而是使用我们转换好的北京时间
+        if current_bj_time < release_dt:
             st.warning(
                 f"⏳ **预约尚未开放**\n\n系统将于 `{settings['release_time']}` 准时开放预约入口，请到点后点击左侧【刷新】按钮。")
         else:
-            # 已经到时间，显示预约表单
             st.success("🟢 预约已开放！请尽快提交（先到先得）。")
 
             with st.form("booking_form"):
@@ -208,11 +205,9 @@ elif role == "普通用户":
                     if not st.session_state.username_input:
                         st.error("❌ 姓名不能为空，请在左侧填写姓名！")
                     else:
-                        # 检查冲突
                         if check_conflict(str(book_date), start_time, end_time):
                             st.error("❌ 预约失败！手慢了，该时间段与他人的预约冲突，请查看上方表格更新后重新选择。")
                         else:
-                            # 写入数据库
                             conn = sqlite3.connect('booking.db')
                             c = conn.cursor()
                             c.execute(
