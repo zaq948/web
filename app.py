@@ -28,7 +28,6 @@ init_db()
 # 获取强制转换为北京时间 (UTC+8) 的当前时间
 def get_beijing_time():
     bj_tz = timezone(timedelta(hours=8))
-    # 获取北京时间后，去掉时区标签，方便与前面的时间字符串做比对
     return datetime.now(bj_tz).replace(tzinfo=None)
 
 
@@ -66,6 +65,15 @@ def get_settings():
     settings = {row[0]: row[1] for row in c.fetchall()}
     conn.close()
     return settings
+
+
+# 【新增函数】删除指定 ID 的预约记录
+def delete_booking(booking_id):
+    conn = sqlite3.connect('booking.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM bookings WHERE id=?", (booking_id,))
+    conn.commit()
+    conn.close()
 
 
 # ================= 页面配置 =================
@@ -120,12 +128,12 @@ if role == "管理员":
             conn.commit()
             conn.close()
             st.warning("记录已清空！")
+            st.rerun()
     elif pwd:
         st.error("密码错误！")
 
 # ================= 普通用户界面 =================
 elif role == "普通用户":
-    # --- 显示当前服务器的北京时间，方便用户核对 ---
     current_bj_time = get_beijing_time()
     st.caption(f"🕒 当前系统时间 (北京时间): {current_bj_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -139,6 +147,7 @@ elif role == "普通用户":
 
     st.subheader(f"📅 机时预约视图 ({target_start_dt} 至 {target_end_dt})")
 
+    # 生成表格
     date_list = []
     current_d = target_start_dt
     while current_d <= target_end_dt:
@@ -173,14 +182,57 @@ elif role == "普通用户":
 
     st.markdown("---")
     st.subheader("📝 预约操作区")
-    st.info(f"💡 提示：您可以提前填好姓名。预约将于 **{settings['release_time']}** 准时开放。")
+    st.info(
+        f"💡 提示：请先在左侧输入姓名，系统将于 **{settings['release_time']}** 准时开放抢号。如需【取消预约】，也请先输入姓名。")
 
     col1, col2 = st.columns([1, 2])
+
+    # === 左侧：输入姓名 ===
     with col1:
+        # 使用 session_state 来保存名字，方便多组件联动
         user_name = st.text_input("1. 输入您的姓名 (必填)", placeholder="例如：张三", key="username_input")
-        if st.button("🔄 刷新最新状态/抢号"):
+        if st.button("🔄 刷新系统 / 抢号"):
             st.rerun()
 
+        # ==========================================
+        # 【新增模块】我的预约（取消功能区）
+        # ==========================================
+        st.markdown("---")
+        st.markdown("##### 🗑️ 我的预约 / 取消")
+        current_name = st.session_state.username_input.strip()
+
+        if not current_name:
+            st.caption("👈 填入姓名后，即可在此查看并取消您的预约。")
+        else:
+            # 去数据库查找这个人的所有预约
+            conn = sqlite3.connect('booking.db')
+            c = conn.cursor()
+            c.execute(
+                "SELECT id, book_date, start_time, end_time FROM bookings WHERE user_name=? ORDER BY book_date, start_time",
+                (current_name,))
+            my_bookings = c.fetchall()
+            conn.close()
+
+            if not my_bookings:
+                st.caption("您目前没有预约记录。")
+            else:
+                st.caption(f"已找到 **{current_name}** 的 {len(my_bookings)} 条记录：")
+                # 遍历显示该用户的所有预约，并添加取消按钮
+                for b in my_bookings:
+                    b_id, b_date, s_time, e_time = b
+
+                    # 手机端适配：用小列宽把文字和按钮分得紧凑一点
+                    bc1, bc2 = st.columns([3, 2])
+                    with bc1:
+                        st.write(f"📅 {b_date}\n⏰ {s_time}-{e_time}")
+                    with bc2:
+                        # 给每个按钮唯一的 key，防止 Streamlit 报错
+                        if st.button("❌ 撤销", key=f"cancel_{b_id}", use_container_width=True):
+                            delete_booking(b_id)
+                            st.success("已取消！")
+                            st.rerun()
+
+    # === 右侧：预约表单 ===
     with col2:
         if current_bj_time < release_dt:
             st.warning(
@@ -195,17 +247,16 @@ elif role == "普通用户":
                 with f_col2:
                     start_time = st.selectbox("开始时间", all_slots, index=0)
                 with f_col3:
-                    # 【核心修改点1】：取消动态联动，直接给完整的时间列表（兼容手机端必须这样做）
                     end_time = st.selectbox("结束时间", get_time_slots(), index=1)
 
                 submitted = st.form_submit_button("✅ 确认抢占机时", use_container_width=True)
 
                 if submitted:
-                    if not st.session_state.username_input:
+                    if not st.session_state.username_input.strip():
                         st.error("❌ 姓名不能为空，请在左侧填写姓名！")
-                    # 【核心修改点2】：增加了后置校验，判断结束时间是否晚于开始时间
                     elif start_time >= end_time:
-                        st.error(f"❌ 时间选择错误：结束时间不能早于或等于开始时间！您选择的是 {start_time} 到 {end_time}。")
+                        st.error(
+                            f"❌ 时间选择错误：结束时间不能早于或等于开始时间！您选择的是 {start_time} 到 {end_time}。")
                     else:
                         if check_conflict(str(book_date), start_time, end_time):
                             st.error("❌ 预约失败！手慢了，该时间段与他人的预约冲突，请查看上方表格更新后重新选择。")
@@ -214,7 +265,8 @@ elif role == "普通用户":
                             c = conn.cursor()
                             c.execute(
                                 "INSERT INTO bookings (user_name, book_date, start_time, end_time) VALUES (?, ?, ?, ?)",
-                                (st.session_state.username_input, str(book_date), start_time, end_time))
+                                (st.session_state.username_input.strip(), str(book_date), start_time, end_time))
                             conn.commit()
                             conn.close()
-                            st.success("🎉 预约成功！点击【刷新】按钮即可在上方表格查看您的排期。")
+                            st.success("🎉 预约成功！您的预约已更新在左下方。")
+                            st.rerun()  # 预约成功后自动刷新，让左下角的个人预约列表立马显示出来
